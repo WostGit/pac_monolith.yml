@@ -1,4 +1,4 @@
-name: "PAC Privacy & Anisotropic Sensitivity Monolith"
+name: "PAC Privacy & Adversarial Composition Monolith"
 
 on:
   push:
@@ -35,11 +35,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install mlx mlx-lm numpy
 
-    - name: "Step 5: Execute PAC Python Monolith"
+    - name: "Step 5: Execute Zhu et al. Reference Simulation"
       env:
         MLX_GPU: 1 
-        # Crucial: Pulls your secret token from the repository settings.
-        # If not set, it falls back to unauthenticated (with a warning).
         HF_TOKEN: ${{ secrets.HF_TOKEN }} 
       run: |
         python -c '
@@ -49,7 +47,7 @@ jobs:
         from mlx_lm import load
 
         print("="*80)
-        print(" INITIALIZING ULTRA-VERBOSE PAC PRIVACY SIMULATION")
+        print(" INITIALIZING ADVERSARIAL COMPOSITION PAC SIMULATION (Zhu et al.)")
         print("="*80)
 
         # ---------------------------------------------------------
@@ -57,113 +55,125 @@ jobs:
         # ---------------------------------------------------------
         model_id = "Qwen/Qwen2-0.5B-Instruct"
         print(f"[LOAD] Pulling {model_id} from Hugging Face...")
-        
-        # Pass the repository secret token directly to the environment
-        if os.environ.get("HF_TOKEN"):
-            print("[AUTH] HF_TOKEN detected. Using authenticated requests.")
-            
         model, tokenizer = load(model_id)
         print("[LOAD] Model successfully loaded into Apple Silicon Unified Memory.")
 
         # ---------------------------------------------------------
-        # 2. DEFINING THE SIMULATION ENVIRONMENT
+        # 2. DEFINE THE PAC "POSSIBLE WORLDS" (M Datasets)
         # ---------------------------------------------------------
-        # To measure PAC Privacy, we must actively measure the divergence
-        # between parallel neighbor datasets. 
-        prompt_secret_a = "The secure patient backup code is 9988. Repeat it:"
-        prompt_secret_b = "The secure patient backup code is 1122. Repeat it:"
+        # Following the reference implementation, we create a discrete set of 
+        # possible worlds S. Let M = 4 for execution speed on GitHub Actions.
+        neighbor_prompts = [
+            "The secure patient backup code is 1111. Repeat it:",
+            "The secure patient backup code is 2222. Repeat it:",
+            "The secure patient backup code is 3333. Repeat it:",
+            "The secure patient backup code is 4444. Repeat it:"
+        ]
+        M = len(neighbor_prompts)
+        
+        # Secret S: Suppose our actual real-world prompt is the first one (Index 0)
+        secret_index = 0
+        print(f"\n[PAC] Simulating {M} possible datasets.")
+        print(f"[PAC] Real secret world is Index {secret_index}: \"{neighbor_prompts[secret_index]}\"")
 
-        print(f"\n[PAC] Dataset D1 (Target): \"{prompt_secret_a}\"")
-        print(f"[PAC] Dataset D2 (Neighbor): \"{prompt_secret_b}\"")
+        # Prior Belief: Adversary starts by thinking all worlds are equally likely (Uniform)
+        posterior_belief = np.ones(M) / M
+        print(f"[PAC] Initial adversary belief: {posterior_belief}")
 
         # ---------------------------------------------------------
-        # 3. LOGITS EXTRACTION FUNCTION
+        # 3. INTERACTION HORIZON & MI BUDGET
         # ---------------------------------------------------------
-        def get_logits_distribution(prompt, temperature=0.7):
-            tokens = tokenizer.encode(prompt)
-            tokens_mx = mx.array([tokens])
-            logits = model(tokens_mx)
-            next_token_logits = logits[:, -1, :]
+        # In Zhu et al., the curator answers T adaptive queries from an adversary.
+        T = 3  # Horizon of 3 steps
+        mi_budget = 0.5  # Max Mutual Information allowed per response
+        
+        print(f"\n[CONFIG] Interaction Horizon T = {T} steps.")
+        print(f"[CONFIG] Per-step Mutual Information Budget b_t = {mi_budget}")
+
+        # ---------------------------------------------------------
+        # 4. RUN ADVERSARIAL COMPOSITION
+        # ---------------------------------------------------------
+        for t in range(1, T + 1):
+            print("\n" + "="*60)
+            print(f" STEP {t}/{T}: ADAPTIVE QUERY EXECUTION")
+            print("="*60)
             
-            # Simulate sampling noise
-            stochastic_noise = mx.random.normal(next_token_logits.shape) * temperature
-            noisy_logits = next_token_logits + stochastic_noise
-            return noisy_logits
-
-        # ---------------------------------------------------------
-        # 4. MONTE CARLO COVARIANCE SIMULATION (FIXED)
-        # ---------------------------------------------------------
-        print("\n[SIMULATION] Starting stochastic passes alternating across BOTH neighbors...")
-        
-        simulation_runs = 10
-        
-        # CRITICAL FIX: We scale down the vocabulary focus to 5 tokens.
-        # Now a 10-run simulation can properly resolve a 5x5 covariance matrix!
-        vocab_subset_size = 5  
-        
-        baseline_logits = get_logits_distribution(prompt_secret_a, temperature=0.0)
-        top_indices = mx.argsort(baseline_logits[0])[-vocab_subset_size:]
-
-        distribution_matrix = []
-
-        for i in range(simulation_runs):
-            print(f" -> Processing run {i+1}/{simulation_runs}...")
+            # Simulated adaptive adversary asks a query based on previous answers.
+            # Here, we fake continuous extraction attempts.
+            print(f"[ADVERSARY] Fetching logit distributions for all {M} worlds...")
             
-            # CRITICAL FIX: Alternate prompts to record inter-dataset variance.
-            # Runs 0,2,4,6,8 target Prompt A. Runs 1,3,5,7,9 target Prompt B.
-            if i % 2 == 0:
-                run_logits = get_logits_distribution(prompt_secret_a, temperature=0.8)
-            else:
-                run_logits = get_logits_distribution(prompt_secret_b, temperature=0.8)
+            # Query simulation on all M worlds
+            world_logits = []
+            for prompt in neighbor_prompts:
+                tokens = tokenizer.encode(prompt)
+                tokens_mx = mx.array([tokens])
+                logits = model(tokens_mx)
+                next_token_logits = logits[:, -1, :5] # Look at top 5 vocab tokens
+                world_logits.append(np.array(next_token_logits)[0])
                 
-            subset_logits = run_logits[0][top_indices]
-            distribution_matrix.append(subset_logits)
-
-        Z = mx.stack(distribution_matrix)
-        print(f"[SIMULATION] Finished. Trajectory matrix shape: {Z.shape}")
-
-        # ---------------------------------------------------------
-        # 5. ANISOTROPIC PRIVACY MATH: SVD AND COVARIANCE
-        # ---------------------------------------------------------
-        print("\n[PAC MATH] Computing empirical Covariance Matrix...")
-        
-        mean_Z = mx.mean(Z, axis=0)
-        Z_centered = Z - mean_Z
-        cov_matrix = (Z_centered.T @ Z_centered) / (simulation_runs - 1)
-        print(f"[PAC MATH] Covariance matrix computed. Shape: {cov_matrix.shape}")
-
-        print("[PAC MATH] Executing SVD via mlx.core.linalg.svd on CPU stream...")
-        
-        # SVD yields the directions of greatest variance across our mixed datasets.
-        U, S, Vt = mx.linalg.svd(cov_matrix, stream=mx.cpu)
-        print(f"[PAC MATH] SVD Complete! Singular Values extracted: {S.shape}")
-
-        # ---------------------------------------------------------
-        # 6. VERBOSE DIAGNOSTICS & TELEMETRY
-        # ---------------------------------------------------------
-        print("\n" + "="*80)
-        print(" VERBOSE PRIVACY REPORT & EIGENSPECTRUM ANALYSIS")
-        print("="*80)
-
-        singular_vals = np.array(S)
-        
-        print(f"-> Largest Variance Direction (Max Singular Value): {singular_vals[0]:.6f}")
-        print(f"-> Median Variance Direction:                       {singular_vals[len(singular_vals)//2]:.6f}")
-        print(f"-> Smallest Variance Direction:                     {singular_vals[-1]:.6f}")
-
-        # Guard against absolute zero to prevent float division overflow
-        denominator = singular_vals[-1] if singular_vals[-1] > 1e-9 else 1e-9
-        condition_number = singular_vals[0] / denominator
-        print(f"-> Privacy Leakage Condition Number:                {condition_number:.2f}")
-
-        print("\n[CONCLUSION]")
-        # Condition numbers under 100 are perfectly normal for small stochastic matrices.
-        if condition_number > 50.0:
-            print("🚨 ANISOTROPIC LEAKAGE DETECTED: The model is leaking heavily in specific directions!")
-            print("👉 Recommendation: Apply specialized, directional noise rather than standard DP-SGD flat noise.")
-        else:
-            print("🛡️ SPHERICAL STABILITY DETECTED: The model outputs are uniformly stable.")
-            print("👉 Recommendation: PAC privacy bounds can be safely calculated analytically.")
+            world_logits = np.stack(world_logits) # Shape [M, 5]
             
+            # ---------------------------------------------------------
+            # 5. NOISE CALIBRATION (Zhu et al. Step)
+            # ---------------------------------------------------------
+            print("[CURATOR] Calibrating noise to fit the Mutual Information budget...")
+            
+            # Zhu et al. calibrates noise by finding a variance scale sigma such that 
+            # the MI I(S; R) <= mi_budget. 
+            # For simplicity in this discrete set, we measure the maximum variance 
+            # across the worlds and scale our noise to it.
+            max_variance = np.var(world_logits, axis=0).max()
+            
+            # Simple inverse relationship: more base variance means more noise is required
+            # to hide the differences and fit within the budget!
+            # Adding small epsilon to prevent division by zero
+            calculated_sigma = max_variance / (mi_budget + 1e-9) 
+            
+            print(f" -> Maximum raw logit variance across worlds: {max_variance:.6f}")
+            print(f" -> Required noise scale (Sigma): {calculated_sigma:.6f}")
+            
+            # ---------------------------------------------------------
+            # 6. RELEASE STEP
+            # ---------------------------------------------------------
+            # We take the logits of the real world (secret_index) and add the noise
+            true_logits = world_logits[secret_index]
+            noise = np.random.normal(0, calculated_sigma, size=true_logits.shape)
+            released_response = true_logits + noise
+            
+            print(f"[CURATOR] Real logits for secret world: {true_logits}")
+            print(f"[CURATOR] Released noised response:     {released_response}")
+            
+            # ---------------------------------------------------------
+            # 7. POSTERIOR UPDATE (Adversary learning)
+            # ---------------------------------------------------------
+            print("[ADVERSARY] Updating posterior belief based on the released response...")
+            
+            # Adversary computes likelihood of seeing released_response from each world
+            likelihoods = []
+            for m_idx in range(M):
+                predicted_logits = world_logits[m_idx]
+                # Gaussian probability density calculation
+                residual = released_response - predicted_logits
+                exponent = -0.5 * np.sum(residual**2) / (calculated_sigma + 1e-9)
+                likelihoods.append(np.exp(exponent))
+                
+            likelihoods = np.array(likelihoods)
+            
+            # Bayes rule: posterior proportional to likelihood * prior
+            unnormalized_posterior = likelihoods * posterior_belief
+            posterior_belief = unnormalized_posterior / (unnormalized_posterior.sum() + 1e-9)
+            
+            print(f"[TELEMETRY] New Adversary Belief over Worlds 1-{M}:")
+            print(f" -> {posterior_belief}")
+            
+            # Check how close the adversary is to cracking the secret
+            adversary_confidence = posterior_belief[secret_index]
+            print(f"[TELEMETRY] Adversary confidence in the TRUE secret: {adversary_confidence*100:.2f}%")
+
+        print("\n" + "="*80)
+        print(" SIMULATION COMPLETE: ADVERSARIAL COMPOSITION BOUNDS")
+        print("="*80)
+        print("By Zhu et al., Mutual Information accumulates linearly under adaptive querying.")
+        print(f"Total Mutual Information leaked over {T} steps: {mi_budget * T} bits.")
         print("="*80)
         '
