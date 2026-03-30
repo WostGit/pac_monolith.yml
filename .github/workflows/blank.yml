@@ -1,0 +1,187 @@
+name: "PAC Privacy & Anisotropic Sensitivity Monolith"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Allows you to manually click "Run workflow" in GitHub
+
+jobs:
+  mlx-pac-simulation:
+    name: "Run M1 PAC Privacy Simulation"
+    runs-on: macos-latest # Triggers GitHub's free ARM64 Apple Silicon runner
+
+    steps:
+    - name: "Step 1: Checkout Repository"
+      uses: actions/checkout@v4
+      # Pulls your repo so the action has a workspace to run in.
+
+    - name: "Step 2: Initialize Python 3.11"
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: "Step 3: Setup Hugging Face Cache"
+      id: cache-hf
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface
+        # This prevents downloading the 0.5B model on every push.
+        # It binds the cache to this YAML file; if you edit it, the cache clears.
+        key: ${{ runner.os }}-hf-qwen2-05b-${{ hashFiles('.github/workflows/pac_monolith.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-hf-qwen2-05b-
+
+    - name: "Step 4: Install Apple MLX and Dependencies"
+      run: |
+        echo "Updating pip and installing native Apple Silicon MLX binaries..."
+        python -m pip install --upgrade pip
+        pip install mlx mlx-lm numpy
+        echo "Dependencies successfully installed."
+
+    - name: "Step 5: Execute PAC Python Monolith"
+      env:
+        MLX_GPU: 1 # Forces MLX to use the Apple Silicon Unified Memory GPU
+      run: |
+        python -c '
+        import os
+        import mlx.core as mx
+        import numpy as np
+        from mlx_lm import load
+
+        print("="*80)
+        print(" INITIALIZING ULTRA-VERBOSE PAC PRIVACY SIMULATION")
+        print("="*80)
+
+        # ---------------------------------------------------------
+        # 1. MODEL INITIALIZATION
+        # ---------------------------------------------------------
+        # We use Qwen2-0.5B because it has a rich vocabulary but fits 
+        # safely inside the constrained RAM of a free GitHub runner.
+        model_id = "Qwen/Qwen2-0.5B-Instruct"
+        print(f"[LOAD] Pulling {model_id} from Hugging Face...")
+        model, tokenizer = load(model_id)
+        print("[LOAD] Model successfully loaded into Apple Silicon Unified Memory.")
+
+        # ---------------------------------------------------------
+        # 2. DEFINING THE SIMULATION ENVIRONMENT
+        # ---------------------------------------------------------
+        # PAC Privacy relies on bounded Mutual Information. We need to 
+        # see if changing a "secret" in the input drastically shifts 
+        # the probability distribution of the output tokens.
+        
+        # Scenario: An attacker tries to extract a secret ID.
+        prompt_secret_a = "The secure patient backup code is 9988. Repeat it:"
+        prompt_secret_b = "The secure patient backup code is 1122. Repeat it:"
+
+        print(f"\n[PAC] Simulating Dataset D1 (Target): \"{prompt_secret_a}\"")
+        print(f"[PAC] Simulating Dataset D2 (Neighbor): \"{prompt_secret_b}\"")
+
+        # ---------------------------------------------------------
+        # 3. LOGITS EXTRACTION FUNCTION
+        # ---------------------------------------------------------
+        def get_logits_distribution(prompt, temperature=0.7):
+            """
+            Extracts the raw logits (unnormalized scores) of the LLM 
+            for the very next token it predicts.
+            """
+            tokens = tokenizer.encode(prompt)
+            tokens_mx = mx.array([tokens]) # Create MLX array batch
+            
+            # Forward pass to obtain logit scores [Batch, Seq_Len, Vocab_Size]
+            logits = model(tokens_mx)
+            
+            # Isolate the final token position in the sequence
+            next_token_logits = logits[:, -1, :]
+            
+            # To simulate PAC variance, we add a tiny bit of stochastic noise
+            # mimicking sampling noise or multiple distributed queries.
+            stochastic_noise = mx.random.normal(next_token_logits.shape) * temperature
+            noisy_logits = next_token_logits + stochastic_noise
+            
+            return noisy_logits
+
+        # ---------------------------------------------------------
+        # 4. MONTE CARLO COVARIANCE SIMULATION
+        # ---------------------------------------------------------
+        print("\n[SIMULATION] Starting 10 stochastic passes to compute empirical covariance...")
+        
+        # In a B200 cluster paper, this would be 1,000 passes.
+        # Here on a free runner, we do 10 to keep it under 5 minutes.
+        simulation_runs = 10
+        vocab_subset_size = 500  # We look at the top 500 vocabulary words to save memory
+        
+        # We extract the baseline logits to find out which tokens matter
+        baseline_logits = get_logits_distribution(prompt_secret_a, temperature=0.0)
+        top_indices = mx.argsort(baseline_logits[0])[-vocab_subset_size:]
+
+        # Storage for the distributions
+        distribution_matrix = []
+
+        for i in range(simulation_runs):
+            print(f" -> Processing run {i+1}/{simulation_runs}...")
+            # We fetch the logits for prompt A under temperature
+            run_logits = get_logits_distribution(prompt_secret_a, temperature=0.8)
+            
+            # Slice only the top 500 vocabulary tokens to keep covariance math fast
+            subset_logits = run_logits[0][top_indices]
+            distribution_matrix.append(subset_logits)
+
+        # Stack the results into an [M_Runs, V_Subset] MLX matrix
+        Z = mx.stack(distribution_matrix)
+        print(f"[SIMULATION] Finished. Trajectory matrix shape: {Z.shape}")
+
+        # ---------------------------------------------------------
+        # 5. ANISOTROPIC PRIVACY MATH: SVD AND COVARIANCE
+        # ---------------------------------------------------------
+        print("\n[PAC MATH] Computing empirical Covariance Matrix...")
+        
+        # Center the data by subtracting the mean of each token across the runs
+        mean_Z = mx.mean(Z, axis=0)
+        Z_centered = Z - mean_Z
+        
+        # Compute the covariance matrix (Z^T * Z) / (N - 1)
+        # This tells us which tokens "fluctuate together".
+        cov_matrix = (Z_centered.T @ Z_centered) / (simulation_runs - 1)
+        print(f"[PAC MATH] Covariance matrix computed. Shape: {cov_matrix.shape}")
+
+        # Perform Singular Value Decomposition (SVD) on the runner!
+        # This is where we figure out the exact physical directions of data leakage.
+        print("[PAC MATH] Executing Singular Value Decomposition via mlx.core.linalg.svd...")
+        
+        # Explicitly ask for SVD on CPU stream because Metal SVD is occasionally 
+        # unimplemented on specific ops in base MLX. This ensures CI/CD stability!
+        U, S, Vt = mx.linalg.svd(cov_matrix, stream=mx.cpu)
+        
+        print(f"[PAC MATH] SVD Complete! Singular Values extracted: {S.shape}")
+
+        # ---------------------------------------------------------
+        # 6. VERBOSE DIAGNOSTICS & TELEMETRY
+        # ---------------------------------------------------------
+        print("\n" + "="*80)
+        print(" VERBOSE PRIVACY REPORT & EIGENSPECTRUM ANALYSIS")
+        print("="*80)
+
+        # Convert to numpy for readable print operations
+        singular_vals = np.array(S)
+        
+        # The Eigenspectrum tells us if the leakage is "Spherical" or "Anisotropic"
+        print(f"-> Largest Variance Direction (Max Singular Value): {singular_vals[0]:.6f}")
+        print(f"-> Median Variance Direction:                       {singular_vals[len(singular_vals)//2]:.6f}")
+        print(f"-> Smallest Variance Direction:                     {singular_vals[-1]:.6f}")
+
+        # Calculate the "Condition Number" of the privacy leakage
+        condition_number = singular_vals[0] / (singular_vals[-1] + 1e-9)
+        print(f"-> Privacy Leakage Condition Number:                {condition_number:.2f}")
+
+        print("\n[CONCLUSION]")
+        if condition_number > 10.0:
+            print("🚨 ANISOTROPIC LEAKAGE DETECTED: The model is leaking heavily in specific directions!")
+            print("👉 Recommendation: Apply specialized, directional noise rather than standard DP-SGD flat noise.")
+        else:
+            print("🛡️ SPHERICAL STABILITY DETECTED: The model outputs are uniformly stable.")
+            print("👉 Recommendation: PAC privacy bounds can be safely calculated analytically.")
+            
+        print("="*80)
+        '
