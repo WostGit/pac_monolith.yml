@@ -10,7 +10,7 @@ on:
 jobs:
   mlx-pac-simulation:
     name: "Run M1 PAC Privacy Simulation"
-    runs-on: macos-latest # Triggers GitHub's free ARM64 Apple Silicon runner
+    runs-on: macos-latest
 
     steps:
     - name: "Step 1: Checkout Repository"
@@ -50,22 +50,19 @@ jobs:
         print(" INITIALIZING ADVERSARIAL COMPOSITION PAC SIMULATION (Zhu et al.)")
         print("="*80)
 
-        # ---------------------------------------------------------
         # 1. MODEL INITIALIZATION
-        # ---------------------------------------------------------
         model_id = "Qwen/Qwen2-0.5B-Instruct"
         print(f"[LOAD] Pulling {model_id} from Hugging Face...")
         model, tokenizer = load(model_id)
         print("[LOAD] Model successfully loaded into Apple Silicon Unified Memory.")
 
-        # ---------------------------------------------------------
         # 2. DEFINE THE PAC "POSSIBLE WORLDS" (M Datasets)
-        # ---------------------------------------------------------
+        # FIX: The prompt now naturally asks the model to predict the secret token!
         neighbor_prompts = [
-            "The secure patient backup code is 1111. Repeat it:",
-            "The secure patient backup code is 2222. Repeat it:",
-            "The secure patient backup code is 3333. Repeat it:",
-            "The secure patient backup code is 4444. Repeat it:"
+            "The patient security PIN is 1",
+            "The patient security PIN is 2",
+            "The patient security PIN is 3",
+            "The patient security PIN is 4"
         ]
         M = len(neighbor_prompts)
         secret_index = 0
@@ -73,13 +70,10 @@ jobs:
         print(f"\n[PAC] Simulating {M} possible datasets.")
         print(f"[PAC] Real secret world is Index {secret_index}: \"{neighbor_prompts[secret_index]}\"")
 
-        # Adversary starts with a uniform prior belief
         posterior_belief = np.ones(M) / M
         print(f"[PAC] Initial adversary belief: {posterior_belief}")
 
-        # ---------------------------------------------------------
         # 3. INTERACTION HORIZON & MI BUDGET
-        # ---------------------------------------------------------
         T = 3  
         mi_budget = 0.5  
         
@@ -96,45 +90,48 @@ jobs:
             
             print(f"[ADVERSARY] Fetching probability distributions for all {M} worlds...")
             
+            # To get a valid slice of tokens that actually matter across all worlds,
+            # we run a baseline pass on the first prompt to find the top 5 predicted tokens.
+            baseline_tokens = tokenizer.encode(neighbor_prompts[0])
+            baseline_logits = model(mx.array([baseline_tokens]))[:, -1, :]
+            # Find indices of the 5 most probable next tokens
+            top_k_indices = mx.argsort(baseline_logits[0])[-5:]
+            
             world_probs = []
             for prompt in neighbor_prompts:
                 tokens = tokenizer.encode(prompt)
                 tokens_mx = mx.array([tokens])
                 logits = model(tokens_mx)
                 
-                # Apply softmax to raw logits to get probabilities
                 probs = mx.softmax(logits[:, -1, :], axis=-1)
-                
-                # CRITICAL FIX: Cast bfloat16 to float32 before sending to NumPy
                 probs_fp32 = probs.astype(mx.float32)
                 
-                # Slice the top 5 probabilities
-                subset_probs = probs_fp32[0, :5]
+                # FIX: Instead of taking indices 0:5, we take the actual top_k_indices
+                subset_probs = probs_fp32[0, top_k_indices]
                 world_probs.append(np.array(subset_probs))
                 
             world_probs = np.stack(world_probs) # Shape [M, 5]
             
-            # ---------------------------------------------------------
             # 5. NOISE CALIBRATION
-            # ---------------------------------------------------------
             print("[CURATOR] Calibrating noise to fit the Mutual Information budget...")
             
             max_variance = np.var(world_probs, axis=0).max()
+            
+            # Enforce a minimum variance floor to prevent division by zero or 0 noise
+            if max_variance < 1e-6:
+                max_variance = 1e-3
+                
             calculated_sigma = max_variance / (mi_budget + 1e-9) 
             
             print(f" -> Maximum raw probability variance: {max_variance:.6f}")
             print(f" -> Required noise scale (Sigma): {calculated_sigma:.6f}")
             
-            # ---------------------------------------------------------
             # 6. RELEASE STEP
-            # ---------------------------------------------------------
             true_probs = world_probs[secret_index]
             noise = np.random.normal(0, calculated_sigma, size=true_probs.shape)
             released_response = true_probs + noise
             
-            # ---------------------------------------------------------
-            # 7. POSTERIOR UPDATE (Adversary learning)
-            # ---------------------------------------------------------
+            # 7. POSTERIOR UPDATE
             print("[ADVERSARY] Updating posterior belief based on the released response...")
             
             likelihoods = []
