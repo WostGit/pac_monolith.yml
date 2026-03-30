@@ -123,7 +123,8 @@ jobs:
             var, final_belief, did_overshoot = run_pac_simulation(M_worlds=test_m, vocab_size=20)
             overshoot_str = "YES [FAIL]" if did_overshoot else "NO [PASS]"
             belief_str = f"{final_belief*100:.2f}%"
-            print(f"{test_m:<12} | {var:.6f:<15} | {belief_str:<20} | {overshoot_str:<10}")
+            # Fixed the float padding here: {:<15.6f}
+            print(f"{test_m:<12} | {var:<15.6f} | {belief_str:<20} | {overshoot_str:<10}")
 
         # =========================================================
         # TEST 2: SCALING VOCABULARY SLICE
@@ -137,7 +138,8 @@ jobs:
         for test_v in [10, 20, 50, 100]:
             var, final_belief, _ = run_pac_simulation(M_worlds=10, vocab_size=test_v)
             belief_str = f"{final_belief*100:.2f}%"
-            print(f"{test_v:<12} | {var:.6f:<15} | {belief_str:<20}")
+            # Fixed the float padding here as well
+            print(f"{test_v:<12} | {var:<15.6f} | {belief_str:<20}")
 
         # =========================================================
         # TEST 3: BASELINE COMPARISON (DP-SGD vs PAC)
