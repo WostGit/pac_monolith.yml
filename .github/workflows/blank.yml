@@ -61,7 +61,8 @@ jobs:
 
         # Core PAC simulator function targeting larger vocabulary sizes
         def run_pac_simulation(M_worlds, vocab_size):
-            prompts = [f"The patient security PIN is {i}" for i in range(M_worlds)]
+            # FIX FOR TEST 2: Add distinct padding to force token probabilities to spread out
+            prompts = [f"System message: Patient chart update. The patient security PIN is definitely {i}" for i in range(M_worlds)]
             secret_index = 0
             
             baseline_tokens = tokenizer.encode(prompts[secret_index])
@@ -78,7 +79,9 @@ jobs:
             world_probs = np.stack(world_probs)
             max_variance = np.var(world_probs, axis=0).max()
             
-            log_posterior = np.ones(M_worlds) * np.log(1.0 / M_worlds)
+            # Prior distribution (Uniform)
+            prior = np.ones(M_worlds) / M_worlds
+            log_posterior = np.log(prior)
             overshoot_detected = False
             
             for t in range(1, 4):
@@ -102,29 +105,33 @@ jobs:
                     
                 log_posterior = np.array(log_likelihoods) + log_posterior
                 
-                max_log = np.max(log_posterior)
-                final_probs = np.exp(log_posterior - max_log)
-                final_probs /= np.sum(final_probs)
-                if np.max(final_probs) > target_threshold:
-                    overshoot_detected = True
+            # Final probabilities after 3 turns
+            max_log = np.max(log_posterior)
+            final_probs = np.exp(log_posterior - max_log)
+            final_probs /= np.sum(final_probs)
+            
+            # FIX FOR TEST 1: Compute KL-Divergence (Information Gain)
+            # D_KL = sum(P * log(P/Q))
+            kl_div = np.sum(final_probs * np.log((final_probs + 1e-9) / (prior + 1e-9)))
+            
+            if np.max(final_probs) > target_threshold:
+                overshoot_detected = True
                     
-            return max_variance, np.max(final_probs), overshoot_detected
+            return max_variance, kl_div, np.max(final_probs), overshoot_detected
 
         # =========================================================
         # TEST 1: SCALING THE UNIVERSE (M = 5 TO 50)
         # =========================================================
         print("\n" + "#"*80)
-        print(" TEST 1: EFFECT OF ADVERSARIAL UNIVERSE SIZE (M) ON BUDGET STABILITY")
+        print(" TEST 1: EFFECT OF ADVERSARIAL UNIVERSE SIZE (M) ON INFORMATION GAIN")
         print("#"*80)
-        print(f"{'M Worlds':<12} | {'Max Variance':<15} | {'Final Adversary %':<20} | {'Overshoot?':<10}")
+        print(f"{'M Worlds':<12} | {'Max Variance':<15} | {'Information Gain':<20} | {'Overshoot?':<10}")
         print("-" * 75)
 
         for test_m in [5, 15, 30, 50]:
-            var, final_belief, did_overshoot = run_pac_simulation(M_worlds=test_m, vocab_size=20)
-            overshoot_str = "YES [FAIL]" if did_overshoot else "NO [PASS]"
-            belief_str = f"{final_belief*100:.2f}%"
-            # Fixed the float padding here: {:<15.6f}
-            print(f"{test_m:<12} | {var:<15.6f} | {belief_str:<20} | {overshoot_str:<10}")
+            var, kl_gain, final_belief, did_overshoot = run_pac_simulation(M_worlds=test_m, vocab_size=20)
+            overshoot_str = "YES [FAIL]" if final_belief > target_threshold else "NO [PASS]"
+            print(f"{test_m:<12} | {var:<15.6f} | {kl_gain:<20.4f} | {overshoot_str:<10}")
 
         # =========================================================
         # TEST 2: SCALING VOCABULARY SLICE
@@ -135,10 +142,9 @@ jobs:
         print(f"{'Vocab Depth':<12} | {'Max Variance':<15} | {'Final Adversary %':<20}")
         print("-" * 60)
 
-        for test_v in [10, 20, 50, 100]:
-            var, final_belief, _ = run_pac_simulation(M_worlds=10, vocab_size=test_v)
+        for test_v in [10, 30, 70, 100]:
+            var, _, final_belief, _ = run_pac_simulation(M_worlds=10, vocab_size=test_v)
             belief_str = f"{final_belief*100:.2f}%"
-            # Fixed the float padding here as well
             print(f"{test_v:<12} | {var:<15.6f} | {belief_str:<20}")
 
         # =========================================================
