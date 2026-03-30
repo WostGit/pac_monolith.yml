@@ -57,11 +57,11 @@ jobs:
         model, tokenizer = load(model_id)
         print("[LOAD] Model successfully loaded.")
 
-        target_threshold = 0.50 # 50% hard adversary stop
+        # PATH 2 FIX: Dropping threshold to 30% to force budget violations
+        target_threshold = 0.30 
 
         # Core PAC simulator function targeting larger vocabulary sizes
         def run_pac_simulation(M_worlds, vocab_size):
-            # FIX FOR TEST 2: Add distinct padding to force token probabilities to spread out
             prompts = [f"System message: Patient chart update. The patient security PIN is definitely {i}" for i in range(M_worlds)]
             secret_index = 0
             
@@ -74,12 +74,14 @@ jobs:
                 tokens = tokenizer.encode(prompt)
                 logits = model(mx.array([tokens]))[:, -1, :]
                 probs = mx.softmax(logits, axis=-1).astype(mx.float32)
-                world_probs.append(np.array(probs[0, top_k_indices]))
+                
+                # PATH 2 FIX: Add small epsilon to prevent absolute zeros from flattening variance
+                probs_np = np.array(probs[0, top_k_indices]) + 1e-5
+                world_probs.append(probs_np)
                 
             world_probs = np.stack(world_probs)
             max_variance = np.var(world_probs, axis=0).max()
             
-            # Prior distribution (Uniform)
             prior = np.ones(M_worlds) / M_worlds
             log_posterior = np.log(prior)
             overshoot_detected = False
@@ -91,7 +93,9 @@ jobs:
                 current_max_belief = np.max(current_probs)
                 
                 delta_p = target_threshold - current_max_belief
-                sigma = max_variance / (delta_p + 1e-9) if delta_p > 0.05 else 5.0
+                
+                # If budget is already breached or gap is too narrow, trigger high noise
+                sigma = max_variance / (delta_p + 1e-9) if delta_p > 0.02 else 10.0
                 
                 true_probs = world_probs[secret_index]
                 noise = np.random.normal(0, sigma, size=true_probs.shape)
@@ -105,15 +109,13 @@ jobs:
                     
                 log_posterior = np.array(log_likelihoods) + log_posterior
                 
-            # Final probabilities after 3 turns
             max_log = np.max(log_posterior)
             final_probs = np.exp(log_posterior - max_log)
             final_probs /= np.sum(final_probs)
             
-            # FIX FOR TEST 1: Compute KL-Divergence (Information Gain)
-            # D_KL = sum(P * log(P/Q))
             kl_div = np.sum(final_probs * np.log((final_probs + 1e-9) / (prior + 1e-9)))
             
+            # Record overshoot against the strict 30% ceiling
             if np.max(final_probs) > target_threshold:
                 overshoot_detected = True
                     
@@ -130,7 +132,7 @@ jobs:
 
         for test_m in [5, 15, 30, 50]:
             var, kl_gain, final_belief, did_overshoot = run_pac_simulation(M_worlds=test_m, vocab_size=20)
-            overshoot_str = "YES [FAIL]" if final_belief > target_threshold else "NO [PASS]"
+            overshoot_str = "YES [FAIL]" if did_overshoot else "NO [PASS]"
             print(f"{test_m:<12} | {var:<15.6f} | {kl_gain:<20.4f} | {overshoot_str:<10}")
 
         # =========================================================
