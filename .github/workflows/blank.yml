@@ -59,14 +59,11 @@ jobs:
 
         target_threshold = 0.50 # 50% hard adversary stop
 
-        # Core PAC simulator function targeting larger vocabulary sizes (Reviewer 1)
+        # Core PAC simulator function targeting larger vocabulary sizes
         def run_pac_simulation(M_worlds, vocab_size):
-            # Generate dummy parallel prompts based on M
             prompts = [f"The patient security PIN is {i}" for i in range(M_worlds)]
             secret_index = 0
             
-            # Step A: Measure variance across the scaling worlds
-            # We grab a larger slice of the vocabulary to prove the scaling bottleneck
             baseline_tokens = tokenizer.encode(prompts[secret_index])
             baseline_logits = model(mx.array([baseline_tokens]))[:, -1, :]
             top_k_indices = mx.argsort(baseline_logits[0])[-vocab_size:]
@@ -81,7 +78,6 @@ jobs:
             world_probs = np.stack(world_probs)
             max_variance = np.var(world_probs, axis=0).max()
             
-            # Step B: Run the 3-turn Bayesian game in the Log Domain
             log_posterior = np.ones(M_worlds) * np.log(1.0 / M_worlds)
             overshoot_detected = False
             
@@ -94,7 +90,6 @@ jobs:
                 delta_p = target_threshold - current_max_belief
                 sigma = max_variance / (delta_p + 1e-9) if delta_p > 0.05 else 5.0
                 
-                # Simulate release and adversary update
                 true_probs = world_probs[secret_index]
                 noise = np.random.normal(0, sigma, size=true_probs.shape)
                 released_probs = true_probs + noise
@@ -107,7 +102,6 @@ jobs:
                     
                 log_posterior = np.array(log_likelihoods) + log_posterior
                 
-                # Check for final budget overshoot
                 max_log = np.max(log_posterior)
                 final_probs = np.exp(log_posterior - max_log)
                 final_probs /= np.sum(final_probs)
@@ -117,21 +111,22 @@ jobs:
             return max_variance, np.max(final_probs), overshoot_detected
 
         # =========================================================
-        # TEST 1: SCALING THE UNIVERSE (M = 5 TO 50) - Reviewer 2
+        # TEST 1: SCALING THE UNIVERSE (M = 5 TO 50)
         # =========================================================
         print("\n" + "#"*80)
         print(" TEST 1: EFFECT OF ADVERSARIAL UNIVERSE SIZE (M) ON BUDGET STABILITY")
         print("#"*80)
         print(f"{'M Worlds':<12} | {'Max Variance':<15} | {'Final Adversary %':<20} | {'Overshoot?':<10}")
-        print("-" * 70)
+        print("-" * 75)
 
         for test_m in [5, 15, 30, 50]:
             var, final_belief, did_overshoot = run_pac_simulation(M_worlds=test_m, vocab_size=20)
             overshoot_str = "YES [FAIL]" if did_overshoot else "NO [PASS]"
-            print(f"{test_m:<12} | {var:.6f:<15} | {final_belief*100:.2f}%{:<13} | {overshoot_str:<10}")
+            belief_str = f"{final_belief*100:.2f}%"
+            print(f"{test_m:<12} | {var:.6f:<15} | {belief_str:<20} | {overshoot_str:<10}")
 
         # =========================================================
-        # TEST 2: SCALING VOCABULARY SLICE - Reviewer 1
+        # TEST 2: SCALING VOCABULARY SLICE
         # =========================================================
         print("\n" + "#"*80)
         print(" TEST 2: EFFECT OF VOCABULARY TRACKING DEPTH ON VARIANCE")
@@ -140,27 +135,22 @@ jobs:
         print("-" * 60)
 
         for test_v in [10, 20, 50, 100]:
-            # Keep M constant at 10 to see vocab impact
             var, final_belief, _ = run_pac_simulation(M_worlds=10, vocab_size=test_v)
-            print(f"{test_v:<12} | {var:.6f:<15} | {final_belief*100:.2f}%{:<20}")
+            belief_str = f"{final_belief*100:.2f}%"
+            print(f"{test_v:<12} | {var:.6f:<15} | {belief_str:<20}")
 
         # =========================================================
-        # TEST 3: BASELINE COMPARISON (DP-SGD vs PAC) - Reviewer 3
+        # TEST 3: BASELINE COMPARISON (DP-SGD vs PAC)
         # =========================================================
         print("\n" + "#"*80)
         print(" TEST 3: PRIVACY LOSS STABILITY VS DP-SGD BASELINE")
         print("#"*80)
         
-        # We simulate a DP-SGD run where privacy loss (Epsilon) is strictly bounded
-        dpsgd_privacy_loss = [0.5, 0.5, 0.5] # Perfectly constant per turn
         pac_privacy_loss = []
-        
-        # Run a standard PAC setup and track belief jumps
         prompts = [f"PIN is {i}" for i in range(6)]
         log_posterior = np.ones(6) * np.log(1.0 / 6)
         
         for _ in range(3):
-            # Simulate a standard release
             log_posterior += np.random.normal(0, 0.5, size=6)
             max_log = np.max(log_posterior)
             p = np.exp(log_posterior - max_log)
