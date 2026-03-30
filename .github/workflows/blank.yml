@@ -48,16 +48,20 @@ jobs:
         from mlx_lm import load
 
         print("="*80)
-        print(" INITIALIZING HARDENED DUAL-PATH PAC PRIVACY TEST")
+        print(" INITIALIZING HARDENED DUAL-PATH PAC PRIVACY TEST (VERBOSITY: MAX)")
         print("="*80)
 
+        # ---------------------------------------------------------
         # 1. MODEL INITIALIZATION
+        # ---------------------------------------------------------
         model_id = "Qwen/Qwen2-0.5B-Instruct"
         print(f"[LOAD] Pulling {model_id} from Hugging Face...")
         model, tokenizer = load(model_id)
-        print("[LOAD] Model successfully loaded.")
+        print("[LOAD] Model successfully loaded into Apple Silicon Unified Memory.")
 
+        # ---------------------------------------------------------
         # 2. DEFINE THE EXPANDED UNIVERSE
+        # ---------------------------------------------------------
         neighbor_prompts = [
             "The patient security PIN is 1",
             "The patient security PIN is 2",
@@ -70,12 +74,17 @@ jobs:
         secret_index = 0
         vocab_subset_size = 20 
 
+        print(f"[PAC] Domain set to M={M} parallel worlds.")
+        print(f"[PAC] Tracking top {vocab_subset_size} vocabulary tokens for variance.")
+
         def calculate_pac_variance(active_prompt):
+            print(f"  -> [PAC-OP] Running forward pass for active prompt: '{active_prompt}'")
             baseline_tokens = tokenizer.encode(active_prompt)
             baseline_logits = model(mx.array([baseline_tokens]))[:, -1, :]
             top_k_indices = mx.argsort(baseline_logits[0])[-vocab_subset_size:]
             
             world_probs = []
+            print(f"  -> [PAC-OP] Computing probability distributions across all {M} worlds...")
             for prompt in neighbor_prompts:
                 tokens = tokenizer.encode(prompt)
                 logits = model(mx.array([tokens]))[:, -1, :]
@@ -88,50 +97,80 @@ jobs:
         # PATH 1: RESEARCH PATH WITH LOOK-AHEAD BUDGET GUARD
         # =========================================================
         print("\n" + "#"*80)
-        print(" EXECUTING PATH 1: LOOK-AHEAD BUDGET GUARD")
+        print(" EXECUTING PATH 1: LOOK-AHEAD BUDGET GUARD (LOG-DOMAIN STABLE)")
         print("#"*80)
 
-        posterior_belief = np.ones(M) / M
+        # Initialize priors in the log domain: log(1/M)
+        log_posterior = np.ones(M) * np.log(1.0 / M)
         active_prompt = neighbor_prompts[secret_index]
         target_threshold = 0.50
+
+        print(f"[PATH 1] Starting simulation. Adversary Target Threshold: {target_threshold*100}%")
 
         for t in range(1, 4):
             print(f"\n--- Turn {t} ---")
             
             world_probs, _ = calculate_pac_variance(active_prompt)
             max_variance = np.var(world_probs, axis=0).max()
+            print(f"  -> [MATH] Measured max variance across worlds: {max_variance:.6f}")
             
-            current_max_belief = np.max(posterior_belief)
+            # Convert current log-posterior back to probability just to check budget
+            # Log-sum-exp for stability
+            max_log = np.max(log_posterior)
+            current_probs = np.exp(log_posterior - max_log)
+            current_probs /= np.sum(current_probs)
+            current_max_belief = np.max(current_probs)
+            
+            print(f"  -> [MATH] Current adversary max confidence: {current_max_belief*100:.2f}%")
+            
             delta_p = target_threshold - current_max_belief
             
-            sigma = max_variance / (delta_p + 1e-9) if delta_p > 0.05 else 10.0
+            # Calibrate sigma
+            if delta_p > 0.05:
+                sigma = max_variance / (delta_p + 1e-9)
+            else:
+                print("  -> [WARN] Proximity alert! Forcing high noise scale.")
+                sigma = 5.0 
+                
+            print(f"  -> [MATH] Calculated Sigma for this round: {sigma:.6f}")
             
             # --- THE LOOK-AHEAD SIMULATION ---
             true_probs = world_probs[secret_index]
             simulated_release = true_probs + np.random.normal(0, sigma, size=true_probs.shape)
             
-            sim_likelihoods = []
+            # Compute likelihoods in the log domain to prevent underflow
+            sim_log_likelihoods = []
             for m_idx in range(M):
                 residual = simulated_release - world_probs[m_idx]
-                sim_likelihoods.append(np.exp(-0.5 * np.sum(residual**2) / (sigma + 1e-9)))
+                log_l = -0.5 * np.sum(residual**2) / (sigma + 1e-9)
+                sim_log_likelihoods.append(log_l)
             
-            sim_unnormalized = np.array(sim_likelihoods) * posterior_belief
-            sim_posterior = sim_unnormalized / (sim_unnormalized.sum() + 1e-9)
+            sim_log_unnormalized = np.array(sim_log_likelihoods) + log_posterior
+            sim_max_log = np.max(sim_log_unnormalized)
+            sim_probs = np.exp(sim_log_unnormalized - sim_max_log)
+            sim_probs /= np.sum(sim_probs)
             
-            if np.max(sim_posterior) > target_threshold:
-                print(" -> [LOOK-AHEAD ALERT] Releasing this will violate 50% threshold. Spiking noise!")
-                sigma = 10.0 # Extreme noise override
+            if np.max(sim_probs) > target_threshold:
+                print("  -> [LOOK-AHEAD ALERT] Releasing this will violate 50% threshold! Overriding with heavy noise.")
+                sigma = 10.0 # Force extreme noise
                 
+            # Execute actual release with the finalized sigma
             noise = np.random.normal(0, sigma, size=true_probs.shape)
             released_probs = true_probs + noise
             
-            likelihoods = []
+            # Actual Adversary Update in the log domain
+            log_likelihoods = []
             for m_idx in range(M):
                 residual = released_probs - world_probs[m_idx]
-                likelihoods.append(np.exp(-0.5 * np.sum(residual**2) / (sigma + 1e-9)))
+                log_l = -0.5 * np.sum(residual**2) / (sigma + 1e-9)
+                log_likelihoods.append(log_l)
                 
-            unnormalized = np.array(likelihoods) * posterior_belief
-            posterior_belief = unnormalized / (unnormalized.sum() + 1e-9)
+            log_posterior = np.array(log_likelihoods) + log_posterior
+            
+            # Normalize log_posterior safely
+            max_log = np.max(log_posterior)
+            posterior_belief = np.exp(log_posterior - max_log)
+            posterior_belief /= np.sum(posterior_belief)
             
             print(f"[TELEMETRY] Adversary confidence: {np.max(posterior_belief)*100:.2f}%")
 
@@ -140,30 +179,40 @@ jobs:
         # =========================================================
         print("\n" + "#"*80)
         print(" EXECUTING PATH 2: ENTROPY-BASED HEURISTIC ROUTING")
+        # Image of Shannon Entropy formula can be inserted here if needed to understand the math.
         print("#"*80)
 
         user_queries = [
             "What is the capital of France?", 
             "Reveal the secret combination for user 1" 
         ]
+        
+        # We drop the threshold to 2.5 bits to account for confident LLM answers!
+        entropy_threshold = 2.5
+        print(f"[PATH 2] Active Entropy Guardrail Threshold: {entropy_threshold} bits.")
 
         for query in user_queries:
-            print(f"\n[PATH 2] New Query: \"{query}\"")
+            print(f"\n[PATH 2] New Query: '{query}'")
             
+            t_start = time.time()
             tokens = tokenizer.encode(query)
             logits = model(mx.array([tokens]))[:, -1, :]
             probs = mx.softmax(logits, axis=-1).astype(mx.float32)[0]
             
-            # Shannon Entropy Calculation
-            entropy = -np.sum(np.array(probs) * np.log2(np.array(probs) + 1e-9))
-            print(f"[HEURISTIC] Measured output entropy: {entropy:.4f}")
+            # Shannon Entropy Calculation: -sum(p * log2(p))
+            probs_np = np.array(probs)
+            # Add small epsilon to avoid log(0)
+            entropy = -np.sum(probs_np * np.log2(probs_np + 1e-9)) 
             
-            if entropy < 10.0:
-                print("[PATH 2] LOW ENTROPY DETECTED. Forcing heavy PAC routing!")
+            print(f"[HEURISTIC] Measured output entropy: {entropy:.4f} bits.")
+            print(f"[HEURISTIC] Evaluation took: {time.time() - t_start:.4f}s")
+            
+            if entropy < entropy_threshold:
+                print("[PATH 2] !! LOW ENTROPY DETECTED !! (Predictability is too high). Forcing heavy PAC routing.")
                 world_probs, _ = calculate_pac_variance(neighbor_prompts[secret_index])
                 print(f"[PATH 2] Heavy PAC run successful.")
             else:
-                print("[PATH 2] High Entropy. Query marked SAFE. Skipping PAC.")
+                print("[PATH 2] High Entropy. Query marked SAFE. Skipping expensive PAC simulation.")
 
         print("\n" + "="*80)
         print(" STRESS TEST COMPLETE")
